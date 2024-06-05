@@ -30,10 +30,12 @@ that things are working).
 
 Run:
 ```
-samply --pico /dev/tty.usbXXXX1 --pico-bootloader b2.elf --pico-reset program.elf
+samply --pico /dev/tty.usbXXXX1 --pico-bootloader b2.elf --pico-reset --rate 50 program.elf
 ```
 
 the target will reset and sampling will start. Omit `--pico-reset` to profile an already-running device. Press `^C` when done to open the profiler front-end. (Note: `program.elf` should already be flashed onto the target pico. This program does not download the program, but it will do that in the future.)
+
+`--rate` takes an argument in Hz (not ms). Note that the default for `samply` is 1ms, which is too fast for this. (It will work, but your code won't run anywhere near full speed!)
 
 ## Internals
 
