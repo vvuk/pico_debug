@@ -21,15 +21,18 @@
 
 #define START_SAMPLING_CMD 0xa0
 #define STOP_SAMPLING_CMD 0xa1
-#define SAMPLE_CMD 0x0a
+#define SAMPLE_CMD 0xb0
 
 #define FLAG_CORES_MASK (1)
 #define FLAG_BOTH_CORES (0 << 0)
 #define FLAG_ONE_CORE (1 << 0)
 
 // Number of bytes the actual address is before the content of the LR
-// register. On Thumb, LR points to 2 bytes past the branch (the insn
-// the jump will return back to).
+// register. Because on ARM LR points to the instruction to be executed
+// on return, we want to point to the actual branch -- which will be either
+// 2 or 4 bytes before. We don't know which one (Thumb insn could be either),
+// but setting it to 2 bytes back will cause the profiler to figure out the right
+// instruction.
 #define LR_OFFSET 2
 
 // These are correct for Pico. The Flash in particular
@@ -77,13 +80,6 @@ static void reset_halt() {
     core_select(0);
 }
 
-// must be a power of 2
-#define US_COST_LEN 32
-// convenient for avg shift
-#define US_COST_POW2 5
-static int us_cost_data[US_COST_LEN];
-static int us_cost_next = 0;
-
 static int was_connected = 0;
 static int profiling_active = 0;
 static int profiling_interval_ms = 100;
@@ -98,10 +94,25 @@ static int prof_task_io();
 static int sample_core(int core_num, uint32_t* frame_buf, int max_frames, uint32_t* timestamp, uint32_t* us_out);
 static int write_frames(int core_num, uint32_t timestamp, uint32_t* frame_buf, int num_frames);
 
-static inline void dump_sampling_time_stats();
+static inline void dump_sampling_time_stats_real();
+
+// convenient for avg shift
+// must be a power of 2
+#define US_COST_POW2 5
+#define US_COST_LEN (1<<(US_COST_POW2))
+static int us_cost_data[US_COST_LEN];
+static int us_cost_next = 0;
+
+// helpers to time how long each sample sequence takes
+#if true
+#define dump_sampling_time_stats() do { } while(0)
+#define record_sampling_time_stats(x) do { } while(0)
+#else
+#define dump_sampling_time_stats dump_sampling_time_stats_real
 static inline void record_sampling_time_stats(uint32_t elapsed) {
     us_cost_data[us_cost_next++] = elapsed;
 }
+#endif
 
 //
 // The main profiler task loop
@@ -137,7 +148,7 @@ void prof_task() {
     task_sleep_ms(profiling_interval_ms);
 }
 
-void dump_sampling_time_stats() {
+void dump_sampling_time_stats_real() {
     if (us_cost_next == US_COST_LEN) {
         uint64_t total_us = 0;
         uint32_t min_us = UINT32_MAX, max_us = 0;
@@ -171,7 +182,7 @@ int prof_task_io() {
             return false;
         }
 
-        debug_printf("SWD initialized for profiler");
+        debug_printf("SWD initialized for profiler\r\n");
         was_connected = 1;
     }
 
@@ -259,7 +270,7 @@ int sample_core(
     core_select(core_num);
     core_halt();
 
-    uint32_t pc, lr, fp, armfp;
+    uint32_t pc, lr, fp;
     uint32_t fplr, fpsp, fpfp;
 
     rc  = reg_read(REG_LR, &lr);
@@ -271,48 +282,50 @@ int sample_core(
     }
 
     int framenum = 0;
-    // Sometimes pc is off in space, and I'm not sure what that means?
-    //if (valid_pc(pc)) {
-        frame_buf[framenum++] = pc;
-    //}
 
-    //debug_printf("core %d: pc=0x%08x lr=0x%08x fp=0x%08x @ %u\r\n", core_num, pc, lr, fp, tstart);
+    // always trust PC
+    frame_buf[framenum++] = pc;
+
+#if false
+    if (core_num == 1) {
+        if (valid_mem(fp)) {
+            mem_read32(fp-4, &fplr);
+            mem_read32(fp-12, &fpfp);
+        } else {
+            fplr = 0;
+            fpfp = 0;
+        }
+        debug_printf("core %d: pc=0x%08x lr=0x%08x fplr=0x%08x fp=0x%08x fpfp=0x%08x @ %u\r\n", core_num, pc, lr, fplr, fp, fpfp, tstart);
+    }
+#endif
 
     if (!valid_mem(fp) || !valid_mem(fp-12)) {
-        debug_printf("core %d: 0x%08x is not a valid FP address\r\n", core_num, fp);
-        framenum = 0;
+        //debug_printf("core %d: 0x%08x is not a valid FP address\r\n", core_num, fp);
+
+        // YOLO lr and give up
+        frame_buf[framenum++] = lr - LR_OFFSET;
         goto FINISH;
     }
 
-    mem_read32(fp-4, &fplr);
-    if (lr != fplr) {
-        // We probably halted after a branch (so lr was updated), but before
-        // the new frame pointer was set up. FP is the previous frame's (meaning
-        // that fplr is the return of _that_ frame), so record lr here as part of the frames
-        if (valid_pc(lr)) {
-            frame_buf[framenum++] = lr - LR_OFFSET;
-        } else {
-            debug_printf("lr 0x%08x is not valid!\r\n", lr);
-        }
-    }
-
+    // Now just trust the frame pointers.
     while (valid_mem(fp) && valid_mem(fp-12) && framenum < max_frames) {
         mem_read32(fp-4, &fplr);
         //mem_read32(fp-8, &fpsp);
         mem_read32(fp-12, &fpfp);
 
-        //debug_printf("core %d: %d: fp=0x%08x fplr=0x%08x fpsp=0x%08x fpfp=0x%08x\r\n", core_num, framenum, fp, fplr, fpsp, fpfp);
-        if (valid_pc(fplr)) {
-            frame_buf[framenum++] = fplr - LR_OFFSET;
-        } else {
-            debug_printf("fplr 0x%08x is not valid!\r\n", fplr);
+        if (fp == fpfp) {
+            // don't get stuck in a loop. also, if fp points back to itself, then
+            // we don't want to include this LR
             break;
         }
 
-        if (fp == fpfp) {
-            // don't get stuck in a loop at the topmost frame pointer
+        //debug_printf("core %d: %d: fp=0x%08x fplr=0x%08x fpsp=0x%08x fpfp=0x%08x\r\n", core_num, framenum, fp, fplr, fpsp, fpfp);
+        if (!valid_pc(fplr)) {
+            //debug_printf("fplr 0x%08x is not valid!\r\n", fplr);
             break;
         }
+
+        frame_buf[framenum++] = fplr - LR_OFFSET;
         fp = fpfp;
     }
 
@@ -320,6 +333,8 @@ FINISH:
     core_select(core_num);
     core_unhalt();
 
+    // Note: without this, the core remains halted. Unclear why this is needed,
+    // someone with more SWD experience will know.
     rc = core_update_status();
     if (rc != SWD_OK) {
         debug_printf("core_update_status failed: %d\r\n", rc);
@@ -327,6 +342,8 @@ FINISH:
 
     *sample_time = tstart;
     *us_out = time_us_32() - tstart;
+
+    //if (core_num == 1) { debug_printf("core %d: pc: 0x%08x lr: 0x%08x final fp: 0x%08x\r\n", pc, lr, fp); }
 
     return framenum;
 }
@@ -336,9 +353,8 @@ FINISH:
 //
 int write_frames(int core_num, uint32_t timestamp, uint32_t* frame_buf, int num_frames) {
     uint32_t header = 0;
-    header |= SAMPLE_CMD << 24; // 0xa = frame command
-    header |= num_frames << 8; // num frames to follow
-    header |= core_num; // core number this stack is from
+    header |= (SAMPLE_CMD | core_num) << 24; // 0xb0 | core_num = sample indicator
+    header |= num_frames & 0xfff; // num frames to follow
 
     // 0 slot is reserved for this purpose
     frame_buf[0] = header;
@@ -349,10 +365,12 @@ int write_frames(int core_num, uint32_t timestamp, uint32_t* frame_buf, int num_
     io_put_bytes(prof_io, (uint8_t*) frame_buf, sizeof(uint32_t) * (num_frames + NUM_RESERVED_FRAMES));
 
 #if false
-    debug_printf("write: 0x%08x 0x%08x 0x%08x", frame_buf[0], frame_buf[1], frame_buf[2]);
+    if (core_num == 1) {
+    debug_printf("core[%d]: write: 0x%08x 0x%08x 0x%08x", core_num, frame_buf[0], frame_buf[1], frame_buf[2]);
     for (int i = 1; i < num_frames; i++)
         debug_printf(" 0x%08x", frame_buf[NUM_RESERVED_FRAMES+i]);
     debug_printf("\r\n");
+    }
 #endif
 #else
     uint32_t *fb = frame_buf+NUM_RESERVED_FRAMES;
